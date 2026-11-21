@@ -66,7 +66,7 @@ export function PackageCard({ pkg, featured = false, onSelect }: PackageCardProp
         </div>
 
         <ul className="mt-5 space-y-2.5">
-          {pkg.features.map((feat, idx) => (
+          {(Array.isArray(pkg.features) ? pkg.features : []).map((feat, idx) => (
             <li key={idx} className="flex items-start gap-2.5 text-sm text-slate-700">
               <Check className="mt-0.5 h-4 w-4 shrink-0 text-[#0B1F4D]" />
               <span>{feat}</span>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Component, useCallback, useEffect, useMemo, useState, type ErrorInfo, type ReactNode } from 'react';
 import { ToastProvider, useToast } from './components/common/ToastContext';
 import { AdminLayout } from './components/layout/AdminLayout';
 import { PublicLayout } from './components/layout/PublicLayout';
@@ -376,10 +376,53 @@ function RouterContent() {
   );
 }
 
+class AppErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; message: string }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, message: '' };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, message: error.message || 'Unexpected application error.' };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('Application render error:', error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex min-h-screen items-center justify-center bg-[#F8FAFC] px-4">
+          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 text-center shadow-sm">
+            <h1 className="text-lg font-bold text-[#0B1F4D]">Roman Communication</h1>
+            <p className="mt-2 text-sm text-slate-600">
+              Unable to display this view right now. Please reload the page.
+            </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="mt-5 rounded-lg bg-[#0B1F4D] px-4 py-2 text-sm font-medium text-white hover:bg-[#132F70]"
+            >
+              Reload Page
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   return (
-    <ToastProvider>
-      <RouterContent />
-    </ToastProvider>
+    <AppErrorBoundary>
+      <ToastProvider>
+        <RouterContent />
+      </ToastProvider>
+    </AppErrorBoundary>
   );
 }

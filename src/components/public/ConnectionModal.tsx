@@ -27,13 +27,15 @@ export function ConnectionModal({
   const [error, setError] = useState<string | null>(null);
   const [submittedRef, setSubmittedRef] = useState<string | null>(null);
 
+  const safePackages = Array.isArray(packages) ? packages : [];
+
   useEffect(() => {
     if (open) {
-      setPackageId(preselectedPackageId || packages[0]?.id || '');
+      setPackageId(preselectedPackageId || safePackages[0]?.id || '');
       setError(null);
       setSubmittedRef(null);
     }
-  }, [open, preselectedPackageId, packages]);
+  }, [open, preselectedPackageId, safePackages]);
 
   if (!open) return null;
 
@@ -162,7 +164,7 @@ export function ConnectionModal({
                   className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm text-[#0B1F4D] focus:border-[#0B1F4D] focus:outline-none"
                 >
                   <option value="">Recommend a package for me</option>
-                  {packages.map((pkg) => (
+                  {safePackages.map((pkg) => (
                     <option key={pkg.id} value={pkg.id}>
                       {pkg.name} ({pkg.speed_mbps} Mbps — {formatBDT(pkg.monthly_price)})
                     </option>
