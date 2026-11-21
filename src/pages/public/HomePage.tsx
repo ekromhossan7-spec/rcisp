@@ -22,10 +22,13 @@ export function HomePage({
   onNavigate,
   onOpenConnection,
 }: HomePageProps) {
-  const previewPackages = packages.filter((p) => p.show_on_home).slice(0, 4);
-  const previewOffers = offers.filter((o) => o.show_on_home).slice(0, 3);
+  const safePackages = Array.isArray(packages) ? packages : [];
+  const safeOffers = Array.isArray(offers) ? offers : [];
+  const safeSections = Array.isArray(sections) ? sections : [];
+  const previewPackages = safePackages.filter((p) => p.show_on_home).slice(0, 4);
+  const previewOffers = safeOffers.filter((o) => o.show_on_home).slice(0, 3);
 
-  if (loading && sections.length === 0) {
+  if (loading && safeSections.length === 0) {
     return (
       <div className="mx-auto max-w-6xl space-y-10 px-4 py-16 sm:px-6 lg:px-8">
         <div className="grid gap-10 lg:grid-cols-12">
@@ -42,7 +45,7 @@ export function HomePage({
 
   return (
     <div>
-      {sections.map((section, sectionIdx) => {
+      {safeSections.map((section, sectionIdx) => {
         const c = section.content;
 
         if (section.section_key === 'hero') {

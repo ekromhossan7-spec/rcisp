@@ -26,9 +26,10 @@ export function CoveragePage({
   const [error, setError] = useState<string | null>(null);
   const [submittedRef, setSubmittedRef] = useState<string | null>(null);
 
-  const headerSection = sections.find((s) => s.section_key === 'header');
-  const zonesSection = sections.find((s) => s.section_key === 'confirmed_zones');
-  const extraSections = sections.filter(
+  const safeSections = Array.isArray(sections) ? sections : [];
+  const headerSection = safeSections.find((s) => s.section_key === 'header');
+  const zonesSection = safeSections.find((s) => s.section_key === 'confirmed_zones');
+  const extraSections = safeSections.filter(
     (s) => s.section_key !== 'header' && s.section_key !== 'confirmed_zones',
   );
 

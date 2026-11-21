@@ -4,6 +4,7 @@ import { AdminLayout } from './components/layout/AdminLayout';
 import { PublicLayout } from './components/layout/PublicLayout';
 import { ConnectionModal } from './components/public/ConnectionModal';
 import { adminAuthApi, publicApi } from './lib/api';
+import { FALLBACK_PUBLIC_SITE, FALLBACK_SECTIONS, FALLBACK_SETTINGS } from './lib/publicDefaults';
 import { AdminCustomersPage } from './pages/admin/AdminCustomersPage';
 import { AdminInquiriesPage } from './pages/admin/AdminInquiriesPage';
 import { AdminLoginPage } from './pages/admin/AdminLoginPage';
@@ -26,28 +27,7 @@ import type {
   PackageRecord,
   PageSeoData,
   PublicSitePayload,
-  WebsiteSettingsMap,
 } from './types/isp';
-
-const FALLBACK_SETTINGS: WebsiteSettingsMap = {
-  company_name: 'Roman Communication',
-  company_tagline: 'Internet Service Provider',
-  logo_url: '/assets/aistudio/image_4c43d9bf.png',
-  logo_alt: 'Roman Communication Logo',
-  favicon_url: '/assets/aistudio/image_4c43d9bf.png',
-  phone: 'To be provided (Support & Sales Desk)',
-  whatsapp: '',
-  email: 'To be provided',
-  address: 'Gulahammad, Masajidda, Sitakunda, Chattogram, Bangladesh.',
-  facebook_url: '',
-  other_social_links: [],
-  google_maps_url: '',
-  header_cta_text: 'Get Connection',
-  footer_description:
-    'Roman Communication is a dedicated Internet Service Provider delivering dependable fiber broadband for households, students, and local businesses in Sitakunda, Chattogram.',
-  footer_copyright: `© ${new Date().getFullYear()} Roman Communication. All rights reserved.`,
-  footer_subtext: 'Internet Service Provider · Sitakunda, Chattogram',
-};
 
 function normalizePath(pathname: string): string {
   if (pathname.length > 1 && pathname.endsWith('/')) {
@@ -153,11 +133,18 @@ function RouterContent() {
         publicApi.getPackages(),
         publicApi.getOffers(),
       ]);
-      setSitePayload(siteRes);
-      setPackages(pkgRes.packages);
-      setOffers(offerRes.offers);
+      if (siteRes && Array.isArray(siteRes.sections) && siteRes.settings) {
+        setSitePayload(siteRes);
+      } else {
+        setSitePayload(FALLBACK_PUBLIC_SITE);
+      }
+      setPackages(Array.isArray(pkgRes?.packages) ? pkgRes.packages : []);
+      setOffers(Array.isArray(offerRes?.offers) ? offerRes.offers : []);
     } catch {
-      // Public fallback handled cleanly by defaults & empty states
+      // Fall back cleanly to built-in public content when backend API is unavailable (e.g. static hosting)
+      setSitePayload((prev) => prev ?? FALLBACK_PUBLIC_SITE);
+      setPackages((prev) => (Array.isArray(prev) ? prev : []));
+      setOffers((prev) => (Array.isArray(prev) ? prev : []));
     } finally {
       setPublicLoading(false);
     }
@@ -245,9 +232,11 @@ function RouterContent() {
   }
 
   const activePageSections = useMemo(() => {
-    if (!sitePayload) return [];
-    return sitePayload.sections
-      .filter((s) => s.page_slug === activeSlug)
+    const sections = Array.isArray(sitePayload?.sections)
+      ? sitePayload.sections
+      : FALLBACK_SECTIONS;
+    return sections
+      .filter((s) => s && s.page_slug === activeSlug)
       .sort((a, b) => a.section_order - b.section_order);
   }, [sitePayload, activeSlug]);
 

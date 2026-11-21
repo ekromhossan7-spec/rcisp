@@ -182,7 +182,7 @@ export function AdminSettingsPage({ onPublished }: AdminSettingsPageProps) {
 
   // Derived active page sections
   const pageSections = useMemo(() => {
-    if (!workspace) return [];
+    if (!workspace || !Array.isArray(workspace.sections)) return [];
     return workspace.sections
       .filter((s) => s.page_slug === selectedPage && !s.deleted_in_draft)
       .sort((a, b) => a.draft_order - b.draft_order);

@@ -26,8 +26,9 @@ export function ContactPage({
   const [error, setError] = useState<string | null>(null);
   const [submittedRef, setSubmittedRef] = useState<string | null>(null);
 
-  const headerSection = sections.find((s) => s.section_key === 'header');
-  const extraSections = sections.filter((s) => s.section_key !== 'header');
+  const safeSections = Array.isArray(sections) ? sections : [];
+  const headerSection = safeSections.find((s) => s.section_key === 'header');
+  const extraSections = safeSections.filter((s) => s.section_key !== 'header');
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();

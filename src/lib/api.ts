@@ -27,6 +27,8 @@ export class ApiError extends Error {
   }
 }
 
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (!headers.has('Content-Type') && options.body) {
@@ -34,25 +36,42 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   }
   headers.set('X-Requested-With', 'XMLHttpRequest');
 
-  const res = await fetch(url, {
+  const targetUrl = url.startsWith('/') && API_BASE ? `${API_BASE}${url}` : url;
+
+  const res = await fetch(targetUrl, {
     ...options,
     headers,
     credentials: 'include',
   });
 
   const text = await res.text();
-  let data: Record<string, unknown> = {};
+  const contentType = res.headers.get('content-type') || '';
+  let data: Record<string, unknown> | null = null;
+
   if (text) {
     try {
-      data = JSON.parse(text) as Record<string, unknown>;
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        data = parsed as Record<string, unknown>;
+      }
     } catch {
-      data = {};
+      // Handled below if response wasn't valid JSON
     }
   }
 
   if (!res.ok) {
-    const msg = typeof data.error === 'string' ? data.error : `Request failed (${res.status})`;
+    const msg =
+      data && typeof data.error === 'string'
+        ? data.error
+        : `Request failed (${res.status})`;
     throw new ApiError(msg, res.status);
+  }
+
+  if (!data || (!contentType.includes('application/json') && text.trim().startsWith('<'))) {
+    throw new ApiError(
+      'Backend API is unavailable at this host (received non-JSON response).',
+      502,
+    );
   }
 
   return data as T;

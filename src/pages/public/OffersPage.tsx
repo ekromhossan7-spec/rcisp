@@ -18,8 +18,10 @@ export function OffersPage({
   onOpenConnection,
   onNavigate,
 }: OffersPageProps) {
-  const headerSection = sections.find((s) => s.section_key === 'header');
-  const extraSections = sections.filter((s) => s.section_key !== 'header');
+  const safeSections = Array.isArray(sections) ? sections : [];
+  const safeOffers = Array.isArray(offers) ? offers : [];
+  const headerSection = safeSections.find((s) => s.section_key === 'header');
+  const extraSections = safeSections.filter((s) => s.section_key !== 'header');
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-14 sm:px-6 lg:px-8">
@@ -45,7 +47,7 @@ export function OffersPage({
             />
           ))}
         </div>
-      ) : offers.length === 0 ? (
+      ) : safeOffers.length === 0 ? (
         <div className="mt-10 rounded-xl border border-slate-200 bg-white p-12 text-center">
           <h2 className="text-lg font-semibold text-[#0B1F4D]">
             No Active Offers at This Moment
@@ -64,7 +66,7 @@ export function OffersPage({
         </div>
       ) : (
         <div className="mt-10 grid gap-6 md:grid-cols-2">
-          {offers.map((offer) => {
+          {safeOffers.map((offer) => {
             const basePrice = offer.package_monthly_price ?? null;
             const finalPrice =
               basePrice !== null

@@ -9,9 +9,11 @@ interface AboutPageProps {
 }
 
 export function AboutPage({ sections, onOpenConnection, onNavigate }: AboutPageProps) {
+  const safeSections = Array.isArray(sections) ? sections : [];
+
   return (
     <div className="mx-auto max-w-6xl space-y-16 px-4 py-14 sm:px-6 lg:px-8">
-      {sections.map((section) => {
+      {safeSections.map((section) => {
         const c = section.content;
 
         if (section.section_key === 'intro') {

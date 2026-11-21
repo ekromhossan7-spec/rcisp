@@ -20,14 +20,16 @@ export function PackagesPage({
 }: PackagesPageProps) {
   const [tier, setTier] = useState<'all' | 'home' | 'high'>('all');
 
-  const headerSection = sections.find((s) => s.section_key === 'header');
-  const extraSections = sections.filter((s) => s.section_key !== 'header');
+  const safeSections = Array.isArray(sections) ? sections : [];
+  const safePackages = Array.isArray(packages) ? packages : [];
+  const headerSection = safeSections.find((s) => s.section_key === 'header');
+  const extraSections = safeSections.filter((s) => s.section_key !== 'header');
 
   const filtered = useMemo(() => {
-    if (tier === 'home') return packages.filter((p) => p.speed_mbps <= 25);
-    if (tier === 'high') return packages.filter((p) => p.speed_mbps > 25);
-    return packages;
-  }, [packages, tier]);
+    if (tier === 'home') return safePackages.filter((p) => p.speed_mbps <= 25);
+    if (tier === 'high') return safePackages.filter((p) => p.speed_mbps > 25);
+    return safePackages;
+  }, [safePackages, tier]);
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-14 sm:px-6 lg:px-8">
