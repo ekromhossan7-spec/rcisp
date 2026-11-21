@@ -1,0 +1,6 @@
+{
+  "name": "Roman Communication",
+  "description": "Fast, reliable broadband internet service provider in Gulahammad, Masajidda, Sitakunda, Chattogram with integrated ISP management system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
