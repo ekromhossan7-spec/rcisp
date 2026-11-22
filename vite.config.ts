@@ -50,6 +50,11 @@ export default defineConfig(() => {
               JSON.stringify({version: 1, include: ['/api/*'], exclude: []}, null, 2),
               'utf8',
             );
+            fs.writeFileSync(
+              path.resolve(distDir, '.assetsignore'),
+              '_worker.js\n_routes.json\n.assetsignore\n',
+              'utf8',
+            );
           }
         },
       },

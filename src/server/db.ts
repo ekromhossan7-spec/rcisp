@@ -289,23 +289,31 @@ async function seedCmsDefaults(db: Client): Promise<void> {
   }
 
   // 2. WebsiteSettings
-  for (const [key, val] of Object.entries(DEFAULT_SETTINGS)) {
-    const serialized = typeof val === 'string' ? val : JSON.stringify(val);
-    await db.execute({
-      sql: `INSERT OR IGNORE INTO website_settings (id, setting_key, draft_value, published_value, has_unpublished_changes)
-            VALUES (?, ?, ?, ?, 0)`,
-      args: [randomUUID(), key, serialized, serialized],
-    });
+  const settingsKeys = Object.entries(DEFAULT_SETTINGS);
+  const settingsCount = await db.execute('SELECT COUNT(*) as total FROM website_settings');
+  if (Number(settingsCount.rows[0]?.total ?? 0) < settingsKeys.length) {
+    for (const [key, val] of settingsKeys) {
+      const serialized = typeof val === 'string' ? val : JSON.stringify(val);
+      await db.execute({
+        sql: `INSERT OR IGNORE INTO website_settings (id, setting_key, draft_value, published_value, has_unpublished_changes)
+              VALUES (?, ?, ?, ?, 0)`,
+        args: [randomUUID(), key, serialized, serialized],
+      });
+    }
   }
 
   // 3. PageSEO
-  for (const slug of Object.keys(DEFAULT_PAGE_SEO) as CmsPageSlug[]) {
-    const serialized = JSON.stringify(DEFAULT_PAGE_SEO[slug]);
-    await db.execute({
-      sql: `INSERT OR IGNORE INTO page_seo (id, page_slug, draft_seo, published_seo, has_unpublished_changes)
-            VALUES (?, ?, ?, ?, 0)`,
-      args: [randomUUID(), slug, serialized, serialized],
-    });
+  const seoSlugs = Object.keys(DEFAULT_PAGE_SEO) as CmsPageSlug[];
+  const seoCount = await db.execute('SELECT COUNT(*) as total FROM page_seo');
+  if (Number(seoCount.rows[0]?.total ?? 0) < seoSlugs.length) {
+    for (const slug of seoSlugs) {
+      const serialized = JSON.stringify(DEFAULT_PAGE_SEO[slug]);
+      await db.execute({
+        sql: `INSERT OR IGNORE INTO page_seo (id, page_slug, draft_seo, published_seo, has_unpublished_changes)
+              VALUES (?, ?, ?, ?, 0)`,
+        args: [randomUUID(), slug, serialized, serialized],
+      });
+    }
   }
 
   // 4. Built-in MediaAssets
