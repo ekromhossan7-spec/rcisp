@@ -1,10 +1,11 @@
-import { randomUUID, timingSafeEqual } from 'node:crypto';
-import { Router } from 'express';
-import { ensureDatabase } from '../db.js';
+import { Router } from '../miniRouter.js';
+import { randomUUID, timingSafeEqualStrings } from '../cryptoWeb.js';
+import { DatabaseConfigError, ensureDatabase } from '../db.js';
+import { getEnv } from '../runtimeEnv.js';
 import {
   clearSessionCookie,
+  extractSessionToken,
   hashPassword,
-  SESSION_COOKIE_NAME,
   setSessionCookie,
   verifyCsrfProtection,
   verifyPassword,
@@ -15,34 +16,34 @@ import type { AdminUser } from '../../types/isp.js';
 
 export const adminAuthRoutes = Router();
 
-function safeCompareStrings(a: string, b: string): boolean {
-  const bufA = Buffer.from(a, 'utf8');
-  const bufB = Buffer.from(b, 'utf8');
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
+function getEnvCredentials() {
+  const envEmail = getEnv('ADMIN_EMAIL')?.trim().toLowerCase() || '';
+  const envPass = getEnv('ADMIN_PASSWORD')?.trim() || '';
+  return {
+    envEmail,
+    envPass,
+    hasEnvCredentials: Boolean(envEmail && envPass),
+  };
 }
 
 adminAuthRoutes.get('/status', async (req, res) => {
   try {
-    const db = await ensureDatabase();
-    const envPassword = process.env.ADMIN_PASSWORD?.trim();
-    const countRes = await db.execute('SELECT COUNT(*) as total FROM admins');
-    const adminCount = Number(countRes.rows[0]?.total ?? 0);
+    const { envEmail, hasEnvCredentials } = getEnvCredentials();
+    const authMode: 'env' | 'db' = hasEnvCredentials ? 'env' : 'db';
 
-    const needsSetup = adminCount === 0 && !envPassword;
+    const rawToken = extractSessionToken(req);
+    const payload = await verifySessionToken(rawToken);
 
-    const rawToken = req.cookies?.[SESSION_COOKIE_NAME] as string | undefined;
-    const payload = verifySessionToken(rawToken);
-    if (!payload) {
-      res.json({ authenticated: false, needsSetup, admin: null });
-      return;
-    }
-
-    const envEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-    if (envEmail && envPassword && payload.id === 'env-admin' && payload.email.toLowerCase() === envEmail) {
+    if (
+      payload &&
+      hasEnvCredentials &&
+      payload.id === 'env-admin' &&
+      payload.email.toLowerCase() === envEmail
+    ) {
       res.json({
         authenticated: true,
         needsSetup: false,
+        authMode,
         admin: {
           id: payload.id,
           name: payload.name,
@@ -53,19 +54,30 @@ adminAuthRoutes.get('/status', async (req, res) => {
       return;
     }
 
+    const db = await ensureDatabase();
+    const countRes = await db.execute('SELECT COUNT(*) as total FROM admins');
+    const adminCount = Number(countRes.rows[0]?.total ?? 0);
+    const needsSetup = adminCount === 0 && !hasEnvCredentials;
+
+    if (!payload) {
+      res.json({ authenticated: false, needsSetup, authMode, admin: null });
+      return;
+    }
+
     const adminRes = await db.execute({
       sql: 'SELECT id, name, email, role FROM admins WHERE id = ? LIMIT 1',
       args: [payload.id],
     });
     const row = adminRes.rows[0];
     if (!row) {
-      res.json({ authenticated: false, needsSetup, admin: null });
+      res.json({ authenticated: false, needsSetup, authMode, admin: null });
       return;
     }
 
     res.json({
       authenticated: true,
       needsSetup: false,
+      authMode,
       admin: {
         id: String(row.id),
         name: String(row.name),
@@ -74,12 +86,26 @@ adminAuthRoutes.get('/status', async (req, res) => {
       },
     });
   } catch (err) {
+    if (err instanceof DatabaseConfigError) {
+      const { hasEnvCredentials } = getEnvCredentials();
+      if (hasEnvCredentials) {
+        res.json({
+          authenticated: false,
+          needsSetup: false,
+          authMode: 'env',
+          admin: null,
+        });
+        return;
+      }
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     console.error('Auth status error:', err);
     res.status(500).json({ error: 'Failed to inspect authentication state.' });
   }
 });
 
-// One-time initial administrator setup route (locked automatically once claimed or when ADMIN_PASSWORD is set)
+// One-time initial administrator setup route (locked automatically once claimed or when both ADMIN_EMAIL and ADMIN_PASSWORD are set)
 adminAuthRoutes.post('/setup', async (req, res) => {
   if (!verifyCsrfProtection(req)) {
     res.status(403).json({ error: 'Cross-site request blocked.' });
@@ -87,7 +113,8 @@ adminAuthRoutes.post('/setup', async (req, res) => {
   }
 
   try {
-    if (process.env.ADMIN_PASSWORD?.trim()) {
+    const { hasEnvCredentials } = getEnvCredentials();
+    if (hasEnvCredentials) {
       res.status(403).json({ error: 'Initial setup is disabled because environment credentials are configured.' });
       return;
     }
@@ -129,9 +156,13 @@ adminAuthRoutes.post('/setup', async (req, res) => {
       email: emailNormalized,
       role: 'super_admin',
     };
-    setSessionCookie(res, admin);
-    res.status(201).json({ admin });
+    const token = await setSessionCookie(req, res, admin);
+    res.status(201).json({ admin, token });
   } catch (err) {
+    if (err instanceof DatabaseConfigError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     console.error('Admin setup error:', err);
     res.status(500).json({ error: 'Failed to initialize administrator account.' });
   }
@@ -151,18 +182,21 @@ adminAuthRoutes.post('/login', async (req, res) => {
     }
 
     const emailNormalized = parsed.data.email.toLowerCase();
-    const envEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-    const envPass = process.env.ADMIN_PASSWORD?.trim();
+    const { envEmail, envPass, hasEnvCredentials } = getEnvCredentials();
 
-    if (envEmail && envPass && safeCompareStrings(emailNormalized, envEmail) && safeCompareStrings(parsed.data.password, envPass)) {
+    if (
+      hasEnvCredentials &&
+      timingSafeEqualStrings(emailNormalized, envEmail) &&
+      timingSafeEqualStrings(parsed.data.password, envPass)
+    ) {
       const admin: AdminUser = {
         id: 'env-admin',
         name: 'System Administrator',
         email: envEmail,
         role: 'super_admin',
       };
-      setSessionCookie(res, admin);
-      res.json({ admin });
+      const token = await setSessionCookie(req, res, admin);
+      res.json({ admin, token });
       return;
     }
 
@@ -190,9 +224,13 @@ adminAuthRoutes.post('/login', async (req, res) => {
       role: String(row.role) as AdminUser['role'],
     };
 
-    setSessionCookie(res, admin);
-    res.json({ admin });
+    const token = await setSessionCookie(req, res, admin);
+    res.json({ admin, token });
   } catch (err) {
+    if (err instanceof DatabaseConfigError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     console.error('Admin login error:', err);
     res.status(500).json({ error: 'Unable to authenticate administrator.' });
   }
@@ -203,6 +241,6 @@ adminAuthRoutes.post('/logout', (req, res) => {
     res.status(403).json({ error: 'Cross-site request blocked.' });
     return;
   }
-  clearSessionCookie(res);
+  clearSessionCookie(req, res);
   res.json({ ok: true });
 });

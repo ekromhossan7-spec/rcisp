@@ -1,5 +1,6 @@
 import { createClient, type Client } from '@libsql/client';
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from './cryptoWeb.js';
+import { getEnv, isNodeRuntime } from './runtimeEnv.js';
 import {
   BUILTIN_MEDIA_SEEDS,
   DEFAULT_PAGE_SEO,
@@ -8,14 +9,34 @@ import {
 } from './cmsSeed.js';
 import type { CmsPageSlug } from '../types/isp.js';
 
+export class DatabaseConfigError extends Error {
+  status = 503;
+  constructor(message: string) {
+    super(message);
+    this.name = 'DatabaseConfigError';
+  }
+}
+
 let client: Client | null = null;
+let clientCacheKey = '';
 let initializedPromise: Promise<void> | null = null;
 
 export function getDb(): Client {
-  if (!client) {
-    const url = process.env.TURSO_DATABASE_URL?.trim() || 'file:roman_communication.db';
-    const authToken = process.env.TURSO_AUTH_TOKEN?.trim() || undefined;
+  const configuredUrl = getEnv('TURSO_DATABASE_URL')?.trim() || '';
+  const authToken = getEnv('TURSO_AUTH_TOKEN')?.trim() || undefined;
+
+  if (!configuredUrl && !isNodeRuntime()) {
+    throw new DatabaseConfigError(
+      'Database is not configured. Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in Cloudflare Pages Environment Variables.',
+    );
+  }
+
+  const url = configuredUrl || 'file:roman_communication.db';
+  const nextKey = `${url}|${authToken || ''}`;
+  if (!client || clientCacheKey !== nextKey) {
     client = createClient(authToken ? { url, authToken } : { url });
+    clientCacheKey = nextKey;
+    initializedPromise = null;
   }
   return client;
 }

@@ -9,6 +9,25 @@ export default defineConfig(() => {
     plugins: [
       react(),
       tailwindcss(),
+      {
+        name: 'disable-hmr-websocket-client',
+        apply: 'serve',
+        transform(code, id) {
+          if (
+            id.includes('vite/dist/client/client.mjs') &&
+            code.includes('transport.connect(createHMRHandler(handleMessage))')
+          ) {
+            return {
+              code: code.replace(
+                'transport.connect(createHMRHandler(handleMessage));',
+                '/* HMR WebSocket disabled */',
+              ),
+              map: null,
+            };
+          }
+          return null;
+        },
+      },
       // Copies src/assets into dist/ so root-relative URLs like
       // "/src/assets/images/..." (e.g. generate_image output) still resolve
       // in production builds. Do not remove.
@@ -25,6 +44,13 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
           }
+          if (fs.existsSync(distDir)) {
+            fs.writeFileSync(
+              path.resolve(distDir, '_routes.json'),
+              JSON.stringify({version: 1, include: ['/api/*'], exclude: []}, null, 2),
+              'utf8',
+            );
+          }
         },
       },
     ],
@@ -34,10 +60,8 @@ export default defineConfig(() => {
       },
     },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modify—file watching is disabled to prevent flickering during agent edits.
-      hmr: process.env.DISABLE_HMR !== 'true',
-      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
+      hmr: false,
+      ws: false,
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },
   };

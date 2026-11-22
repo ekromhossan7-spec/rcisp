@@ -96,6 +96,8 @@ function RouterContent() {
   const [authChecked, setAuthChecked] = useState(false);
   const [adminUser, setAdminUser] = useState<AdminUser | null>(null);
   const [needsSetup, setNeedsSetup] = useState(false);
+  const [authMode, setAuthMode] = useState<'env' | 'db'>('db');
+  const [authStatusError, setAuthStatusError] = useState<string | null>(null);
 
   const navigate = useCallback(
     (to: string) => {
@@ -196,6 +198,8 @@ function RouterContent() {
         if (!active) return;
         setAdminUser(res.admin);
         setNeedsSetup(res.needsSetup);
+        setAuthMode(res.authMode ?? 'db');
+        setAuthStatusError(null);
         setAuthChecked(true);
         if (currentPath === '/admin' || (currentPath === '/admin/login' && res.authenticated)) {
           navigate(res.authenticated ? '/admin/dashboard' : '/admin/login');
@@ -203,8 +207,9 @@ function RouterContent() {
           navigate('/admin/login');
         }
       })
-      .catch(() => {
+      .catch((err) => {
         if (!active) return;
+        setAuthStatusError(err instanceof Error ? err.message : null);
         setAuthChecked(true);
         if (currentPath.startsWith('/admin/dashboard')) {
           navigate('/admin/login');
@@ -254,10 +259,13 @@ function RouterContent() {
       return (
         <AdminLoginPage
           needsSetup={needsSetup}
+          authMode={authMode}
+          initialError={authStatusError}
           onNavigate={navigate}
           onSuccess={(admin) => {
             setAdminUser(admin);
             setNeedsSetup(false);
+            setAuthStatusError(null);
             showToast(`Welcome back, ${admin.name}`);
             navigate('/admin/dashboard');
           }}

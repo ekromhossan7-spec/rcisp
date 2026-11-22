@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { Router } from 'express';
+import { Router } from '../miniRouter.js';
+import { base64ToBytes, bytesToBase64, randomUUID } from '../cryptoWeb.js';
 import { ensureDatabase } from '../db.js';
 import { requireAdmin, type AuthenticatedRequest } from '../auth.js';
 import {
@@ -476,7 +476,13 @@ cmsAdminRoutes.post('/media', async (req: AuthenticatedRequest, res) => {
 
     const d = parsed.data;
     const rawBase64 = d.data_base64.includes(',') ? d.data_base64.split(',')[1] || '' : d.data_base64;
-    const buf = Buffer.from(rawBase64, 'base64');
+    let buf: Uint8Array;
+    try {
+      buf = base64ToBytes(rawBase64);
+    } catch {
+      res.status(400).json({ error: 'Invalid base64 image payload.' });
+      return;
+    }
 
     if (!verifyImageMagicBytes(buf, d.file_type)) {
       res.status(400).json({
@@ -493,7 +499,7 @@ cmsAdminRoutes.post('/media', async (req: AuthenticatedRequest, res) => {
     await db.execute({
       sql: `INSERT INTO media_assets (id, file_name, file_url, alt_text, file_type, file_size, category, is_builtin, data_base64)
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-      args: [id, safeName, fileUrl, d.alt_text, d.file_type, buf.length, d.category, buf.toString('base64')],
+      args: [id, safeName, fileUrl, d.alt_text, d.file_type, buf.length, d.category, bytesToBase64(buf)],
     });
 
     await recordAuditLog(
@@ -531,7 +537,13 @@ cmsAdminRoutes.put('/media/:id/replace', async (req: AuthenticatedRequest, res) 
 
     const d = parsed.data;
     const rawBase64 = d.data_base64.includes(',') ? d.data_base64.split(',')[1] || '' : d.data_base64;
-    const buf = Buffer.from(rawBase64, 'base64');
+    let buf: Uint8Array;
+    try {
+      buf = base64ToBytes(rawBase64);
+    } catch {
+      res.status(400).json({ error: 'Invalid base64 replacement image.' });
+      return;
+    }
 
     if (!verifyImageMagicBytes(buf, d.file_type)) {
       res.status(400).json({
@@ -567,7 +579,7 @@ cmsAdminRoutes.put('/media/:id/replace', async (req: AuthenticatedRequest, res) 
           d.alt_text,
           d.file_type,
           buf.length,
-          buf.toString('base64'),
+          bytesToBase64(buf),
           req.params.id,
         ],
       });

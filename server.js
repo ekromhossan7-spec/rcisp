@@ -1,13 +1,512 @@
 // server.ts
 import "dotenv/config";
+import { scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import cookieParser from "cookie-parser";
 import express from "express";
 
+// src/server/miniRouter.ts
+var MiniRouter = class {
+  constructor() {
+    this.middlewares = [];
+    this.routes = [];
+  }
+  use(handler) {
+    this.middlewares.push(handler);
+    return this;
+  }
+  add(method, pattern, handler) {
+    const clean = pattern === "/" ? "" : pattern.replace(/^\/+|\/+$/g, "");
+    const segments = clean ? clean.split("/") : [];
+    this.routes.push({ method: method.toUpperCase(), pattern, segments, handler });
+    return this;
+  }
+  get(pattern, handler) {
+    return this.add("GET", pattern, handler);
+  }
+  post(pattern, handler) {
+    return this.add("POST", pattern, handler);
+  }
+  put(pattern, handler) {
+    return this.add("PUT", pattern, handler);
+  }
+  patch(pattern, handler) {
+    return this.add("PATCH", pattern, handler);
+  }
+  delete(pattern, handler) {
+    return this.add("DELETE", pattern, handler);
+  }
+  match(method, subPath) {
+    const upper = method.toUpperCase();
+    const clean = subPath === "/" ? "" : subPath.replace(/^\/+|\/+$/g, "");
+    const parts = clean ? clean.split("/") : [];
+    for (const route of this.routes) {
+      if (route.method !== upper) continue;
+      if (route.segments.length !== parts.length) continue;
+      const params = {};
+      let matched = true;
+      for (let i = 0; i < route.segments.length; i++) {
+        const seg = route.segments[i];
+        const val = parts[i];
+        if (seg.startsWith(":")) {
+          try {
+            params[seg.slice(1)] = decodeURIComponent(val);
+          } catch {
+            params[seg.slice(1)] = val;
+          }
+        } else if (seg !== val) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) {
+        return { handler: route.handler, params };
+      }
+    }
+    return null;
+  }
+};
+function Router() {
+  return new MiniRouter();
+}
+function parseCookieHeader(header) {
+  const cookies = {};
+  if (!header) return cookies;
+  const pairs = header.split(";");
+  for (const pair of pairs) {
+    const idx = pair.indexOf("=");
+    if (idx <= 0) continue;
+    const key = pair.slice(0, idx).trim();
+    let val = pair.slice(idx + 1).trim();
+    if (val.startsWith('"') && val.endsWith('"')) {
+      val = val.slice(1, -1);
+    }
+    try {
+      cookies[key] = decodeURIComponent(val);
+    } catch {
+      cookies[key] = val;
+    }
+  }
+  return cookies;
+}
+function serializeSetCookie(name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  parts.push(`Path=${options.path || "/"}`);
+  if (typeof options.maxAge === "number") {
+    const seconds = Math.max(0, Math.floor(options.maxAge / 1e3));
+    parts.push(`Max-Age=${seconds}`);
+    if (seconds === 0) {
+      parts.push("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+  }
+  if (options.httpOnly) parts.push("HttpOnly");
+  if (options.secure) parts.push("Secure");
+  if (options.sameSite === "none") parts.push("SameSite=None");
+  else if (options.sameSite === "strict") parts.push("SameSite=Strict");
+  else if (options.sameSite === "lax") parts.push("SameSite=Lax");
+  if (options.partitioned) parts.push("Partitioned");
+  return parts.join("; ");
+}
+function mountMiniRouterOnExpress(app, prefix, router) {
+  const normalizedPrefix = prefix.replace(/\/+$/, "");
+  app.use(normalizedPrefix, async (req, res, next) => {
+    const subPath = req.path || "/";
+    const matched = router.match(req.method, subPath);
+    if (!matched) {
+      next();
+      return;
+    }
+    const query = {};
+    for (const [k, v] of Object.entries(req.query || {})) {
+      if (typeof v === "string") query[k] = v;
+      else if (Array.isArray(v) && typeof v[0] === "string") query[k] = v[0];
+    }
+    const miniReq = {
+      method: req.method,
+      path: subPath,
+      params: matched.params,
+      query,
+      body: req.body,
+      cookies: req.cookies || {},
+      secure: req.secure,
+      get(name) {
+        return req.get(name);
+      }
+    };
+    const miniRes = {
+      status(code) {
+        res.status(code);
+        return miniRes;
+      },
+      json(data) {
+        if (!res.headersSent) res.json(data);
+      },
+      send(body) {
+        if (!res.headersSent) {
+          if (body instanceof Uint8Array && !Buffer.isBuffer(body)) {
+            res.send(Buffer.from(body));
+          } else {
+            res.send(body);
+          }
+        }
+      },
+      setHeader(name, value) {
+        res.setHeader(name, value);
+      },
+      cookie(name, value, options) {
+        res.cookie(name, value, options || {});
+      },
+      clearCookie(name, options) {
+        res.clearCookie(name, options || {});
+      }
+    };
+    try {
+      let idx = 0;
+      const runChain = async () => {
+        if (res.headersSent) return;
+        if (idx < router.middlewares.length) {
+          const mw = router.middlewares[idx++];
+          await mw(miniReq, miniRes, runChain);
+          return;
+        }
+        await matched.handler(miniReq, miniRes, () => {
+        });
+      };
+      await runChain();
+    } catch (err) {
+      next(err);
+    }
+  });
+}
+function createFetchApiHandler(mounts) {
+  const orderedMounts = [...mounts].sort((a, b) => b.prefix.length - a.prefix.length);
+  return async function handleApiFetch2(request) {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+    const origin = request.headers.get("origin");
+    const applySecurityAndCors = (headers) => {
+      headers.set("X-Content-Type-Options", "nosniff");
+      headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+      if (origin) {
+        headers.set("Access-Control-Allow-Origin", origin);
+        headers.set("Access-Control-Allow-Credentials", "true");
+        headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+        headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+        headers.set("Vary", "Origin");
+      }
+    };
+    if (request.method.toUpperCase() === "OPTIONS") {
+      const headers = new Headers();
+      applySecurityAndCors(headers);
+      return new Response(null, { status: 204, headers });
+    }
+    if (pathname === "/api/health" && request.method.toUpperCase() === "GET") {
+      const headers = new Headers({ "Content-Type": "application/json; charset=utf-8" });
+      applySecurityAndCors(headers);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+    }
+    let targetMount = null;
+    let subPath = "/";
+    for (const mount of orderedMounts) {
+      const cleanPrefix = mount.prefix.replace(/\/+$/, "");
+      if (pathname === cleanPrefix || pathname.startsWith(`${cleanPrefix}/`)) {
+        targetMount = mount;
+        subPath = pathname.slice(cleanPrefix.length) || "/";
+        break;
+      }
+    }
+    if (!targetMount) {
+      const headers = new Headers({ "Content-Type": "application/json; charset=utf-8" });
+      applySecurityAndCors(headers);
+      return new Response(JSON.stringify({ error: "API endpoint not found." }), {
+        status: 404,
+        headers
+      });
+    }
+    const matched = targetMount.router.match(request.method, subPath);
+    if (!matched) {
+      const headers = new Headers({ "Content-Type": "application/json; charset=utf-8" });
+      applySecurityAndCors(headers);
+      return new Response(JSON.stringify({ error: "API endpoint not found." }), {
+        status: 404,
+        headers
+      });
+    }
+    let parsedBody = void 0;
+    const methodUpper = request.method.toUpperCase();
+    if (methodUpper !== "GET" && methodUpper !== "HEAD") {
+      const contentType = request.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        try {
+          parsedBody = await request.json();
+        } catch {
+          const headers = new Headers({ "Content-Type": "application/json; charset=utf-8" });
+          applySecurityAndCors(headers);
+          return new Response(JSON.stringify({ error: "Invalid JSON request body." }), {
+            status: 400,
+            headers
+          });
+        }
+      }
+    }
+    const query = {};
+    url.searchParams.forEach((value, key) => {
+      if (!(key in query)) query[key] = value;
+    });
+    const miniReq = {
+      method: methodUpper,
+      path: subPath,
+      params: matched.params,
+      query,
+      body: parsedBody,
+      cookies: parseCookieHeader(request.headers.get("cookie")),
+      secure: url.protocol === "https:" || request.headers.get("x-forwarded-proto") === "https",
+      get(name) {
+        return request.headers.get(name) ?? void 0;
+      }
+    };
+    let statusCode = 200;
+    const resHeaders = new Headers();
+    const setCookies = [];
+    let finalResponse = null;
+    const finalize = (body, defaultContentType) => {
+      if (finalResponse) return;
+      if (defaultContentType && !resHeaders.has("Content-Type")) {
+        resHeaders.set("Content-Type", defaultContentType);
+      }
+      applySecurityAndCors(resHeaders);
+      for (const sc of setCookies) {
+        resHeaders.append("Set-Cookie", sc);
+      }
+      finalResponse = new Response(body, { status: statusCode, headers: resHeaders });
+    };
+    const miniRes = {
+      status(code) {
+        statusCode = code;
+        return miniRes;
+      },
+      json(data) {
+        finalize(JSON.stringify(data), "application/json; charset=utf-8");
+      },
+      send(body) {
+        if (body instanceof Uint8Array) {
+          finalize(body, "application/octet-stream");
+        } else if (typeof body === "string") {
+          finalize(body, "text/plain; charset=utf-8");
+        } else {
+          finalize(JSON.stringify(body), "application/json; charset=utf-8");
+        }
+      },
+      setHeader(name, value) {
+        resHeaders.set(name, value);
+      },
+      cookie(name, value, options) {
+        setCookies.push(serializeSetCookie(name, value, options));
+      },
+      clearCookie(name, options) {
+        setCookies.push(serializeSetCookie(name, "", { ...options, maxAge: 0 }));
+      }
+    };
+    try {
+      let idx = 0;
+      const runChain = async () => {
+        if (finalResponse) return;
+        if (idx < targetMount.router.middlewares.length) {
+          const mw = targetMount.router.middlewares[idx++];
+          await mw(miniReq, miniRes, runChain);
+          return;
+        }
+        await matched.handler(miniReq, miniRes, () => {
+        });
+      };
+      await runChain();
+      if (!finalResponse) {
+        finalize(JSON.stringify({ error: "Empty response from handler." }), "application/json; charset=utf-8");
+      }
+      return finalResponse;
+    } catch (err) {
+      console.error("API fetch error:", err);
+      const headers = new Headers({ "Content-Type": "application/json; charset=utf-8" });
+      applySecurityAndCors(headers);
+      return new Response(JSON.stringify({ error: "Internal server error." }), {
+        status: 500,
+        headers
+      });
+    }
+  };
+}
+
+// src/server/cryptoWeb.ts
+var textEncoder = new TextEncoder();
+var textDecoder = new TextDecoder();
+var legacyScryptVerifier = null;
+function registerLegacyScryptVerifier(fn) {
+  legacyScryptVerifier = fn;
+}
+function randomUUID() {
+  return globalThis.crypto.randomUUID();
+}
+function randomBytes(length) {
+  const bytes = new Uint8Array(length);
+  globalThis.crypto.getRandomValues(bytes);
+  return bytes;
+}
+function bytesToHex(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+function hexToBytes(hex) {
+  if (hex.length % 2 !== 0) return null;
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    const byte = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    if (Number.isNaN(byte)) return null;
+    bytes[i] = byte;
+  }
+  return bytes;
+}
+function randomHex(byteLength) {
+  return bytesToHex(randomBytes(byteLength));
+}
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 32768;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...slice);
+  }
+  return btoa(binary);
+}
+function base64ToBytes(base64) {
+  const normalized = base64.replace(/\s+/g, "");
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+function bytesToBase64Url(bytes) {
+  return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function base64UrlToBytes(base64Url) {
+  const padded = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+  const padLen = (4 - padded.length % 4) % 4;
+  return base64ToBytes(padded + "=".repeat(padLen));
+}
+function utf8ToBase64Url(str) {
+  return bytesToBase64Url(textEncoder.encode(str));
+}
+function base64UrlToUtf8(base64Url) {
+  return textDecoder.decode(base64UrlToBytes(base64Url));
+}
+function timingSafeEqualBytes(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+function timingSafeEqualStrings(a, b) {
+  return timingSafeEqualBytes(textEncoder.encode(a), textEncoder.encode(b));
+}
+async function importHmacKey(secret) {
+  return globalThis.crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+}
+async function signHmacSha256(message, secret) {
+  const key = await importHmacKey(secret);
+  const sig = await globalThis.crypto.subtle.sign("HMAC", key, textEncoder.encode(message));
+  return bytesToBase64Url(new Uint8Array(sig));
+}
+async function verifyHmacSha256(message, signatureB64Url, secret) {
+  const expected = await signHmacSha256(message, secret);
+  return timingSafeEqualStrings(signatureB64Url, expected);
+}
+var PBKDF2_ITERATIONS = 1e5;
+async function hashPasswordPortable(password) {
+  const salt = randomBytes(16);
+  const keyMaterial = await globalThis.crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const derived = await globalThis.crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: PBKDF2_ITERATIONS,
+      hash: "SHA-256"
+    },
+    keyMaterial,
+    256
+  );
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${bytesToHex(salt)}$${bytesToHex(new Uint8Array(derived))}`;
+}
+async function verifyPasswordPortable(password, storedHash) {
+  if (storedHash.startsWith("pbkdf2$")) {
+    const parts = storedHash.split("$");
+    if (parts.length !== 4) return false;
+    const iterations = Number(parts[1]);
+    const salt = hexToBytes(parts[2]);
+    const expected = hexToBytes(parts[3]);
+    if (!Number.isFinite(iterations) || iterations < 1e4 || !salt || !expected) {
+      return false;
+    }
+    const keyMaterial = await globalThis.crypto.subtle.importKey(
+      "raw",
+      textEncoder.encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"]
+    );
+    const derived = await globalThis.crypto.subtle.deriveBits(
+      {
+        name: "PBKDF2",
+        salt,
+        iterations,
+        hash: "SHA-256"
+      },
+      keyMaterial,
+      expected.length * 8
+    );
+    return timingSafeEqualBytes(new Uint8Array(derived), expected);
+  }
+  if (legacyScryptVerifier) {
+    return legacyScryptVerifier(password, storedHash);
+  }
+  return false;
+}
+
 // src/server/db.ts
 import { createClient } from "@libsql/client";
-import { randomUUID } from "node:crypto";
+
+// src/server/runtimeEnv.ts
+var currentEnv = {};
+function getEnv(key) {
+  if (Object.prototype.hasOwnProperty.call(currentEnv, key)) {
+    return currentEnv[key];
+  }
+  const proc = globalThis.process;
+  return proc?.env?.[key];
+}
+function isNodeRuntime() {
+  const proc = globalThis.process;
+  return Boolean(proc?.versions?.node);
+}
 
 // src/server/cmsSeed.ts
 var DEFAULT_SECTIONS = [
@@ -383,13 +882,30 @@ var BUILTIN_MEDIA_SEEDS = [
 ];
 
 // src/server/db.ts
+var DatabaseConfigError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.status = 503;
+    this.name = "DatabaseConfigError";
+  }
+};
 var client = null;
+var clientCacheKey = "";
 var initializedPromise = null;
 function getDb() {
-  if (!client) {
-    const url = process.env.TURSO_DATABASE_URL?.trim() || "file:roman_communication.db";
-    const authToken = process.env.TURSO_AUTH_TOKEN?.trim() || void 0;
+  const configuredUrl = getEnv("TURSO_DATABASE_URL")?.trim() || "";
+  const authToken = getEnv("TURSO_AUTH_TOKEN")?.trim() || void 0;
+  if (!configuredUrl && !isNodeRuntime()) {
+    throw new DatabaseConfigError(
+      "Database is not configured. Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in Cloudflare Pages Environment Variables."
+    );
+  }
+  const url = configuredUrl || "file:roman_communication.db";
+  const nextKey = `${url}|${authToken || ""}`;
+  if (!client || clientCacheKey !== nextKey) {
     client = createClient(authToken ? { url, authToken } : { url });
+    clientCacheKey = nextKey;
+    initializedPromise = null;
   }
   return client;
 }
@@ -802,42 +1318,30 @@ async function seedInitialCatalog(db) {
   }
 }
 
-// src/server/routes/adminAuthRoutes.ts
-import { randomUUID as randomUUID2, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
-import { Router } from "express";
-
 // src/server/auth.ts
-import {
-  createHmac,
-  randomBytes,
-  scrypt as scryptCallback,
-  timingSafeEqual
-} from "node:crypto";
-import { promisify } from "node:util";
-var scryptAsync = promisify(scryptCallback);
 var SESSION_COOKIE_NAME = "rc_admin_session";
 var SESSION_TTL_MS = 8 * 60 * 60 * 1e3;
-var EPHEMERAL_SESSION_SECRET = randomBytes(32).toString("hex");
-function getSessionSecret() {
-  const configured = process.env.SESSION_SECRET?.trim();
-  return configured && configured.length >= 16 ? configured : EPHEMERAL_SESSION_SECRET;
+var EPHEMERAL_SESSION_SECRET = randomHex(32);
+async function getSessionSecret() {
+  const configured = getEnv("SESSION_SECRET")?.trim();
+  if (configured && configured.length >= 16) return configured;
+  const seedMaterial = getEnv("TURSO_AUTH_TOKEN")?.trim() || getEnv("ADMIN_PASSWORD")?.trim();
+  if (seedMaterial) {
+    const digest = await globalThis.crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(`rc-session-v1:${seedMaterial}`)
+    );
+    return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return EPHEMERAL_SESSION_SECRET;
 }
 async function hashPassword(password) {
-  const salt = randomBytes(16).toString("hex");
-  const derived = await scryptAsync(password, salt, 64);
-  return `${salt}:${derived.toString("hex")}`;
+  return hashPasswordPortable(password);
 }
 async function verifyPassword(password, storedHash) {
-  const parts = storedHash.split(":");
-  if (parts.length !== 2) return false;
-  const [salt, expectedHex] = parts;
-  if (!salt || !expectedHex) return false;
-  const expectedBuf = Buffer.from(expectedHex, "hex");
-  const derivedBuf = await scryptAsync(password, salt, 64);
-  if (expectedBuf.length !== derivedBuf.length) return false;
-  return timingSafeEqual(expectedBuf, derivedBuf);
+  return verifyPasswordPortable(password, storedHash);
 }
-function signSessionToken(user) {
+async function signSessionToken(user) {
   const payload = {
     id: user.id,
     name: user.name,
@@ -845,25 +1349,23 @@ function signSessionToken(user) {
     role: user.role,
     exp: Date.now() + SESSION_TTL_MS
   };
-  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  const sig = createHmac("sha256", getSessionSecret()).update(encoded).digest("base64url");
+  const encoded = utf8ToBase64Url(JSON.stringify(payload));
+  const secret = await getSessionSecret();
+  const sig = await signHmacSha256(encoded, secret);
   return `${encoded}.${sig}`;
 }
-function verifySessionToken(token) {
+async function verifySessionToken(token) {
   if (!token) return null;
   const dotIdx = token.indexOf(".");
   if (dotIdx <= 0) return null;
   const encoded = token.slice(0, dotIdx);
   const sig = token.slice(dotIdx + 1);
   if (!encoded || !sig) return null;
-  const expectedSig = createHmac("sha256", getSessionSecret()).update(encoded).digest("base64url");
-  const sigBuf = Buffer.from(sig);
-  const expectedBuf = Buffer.from(expectedSig);
-  if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
-    return null;
-  }
+  const secret = await getSessionSecret();
+  const validSig = await verifyHmacSha256(encoded, sig, secret);
+  if (!validSig) return null;
   try {
-    const parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    const parsed = JSON.parse(base64UrlToUtf8(encoded));
     if (!parsed || typeof parsed.exp !== "number" || parsed.exp < Date.now()) {
       return null;
     }
@@ -875,23 +1377,39 @@ function verifySessionToken(token) {
     return null;
   }
 }
-function setSessionCookie(res, user) {
-  const token = signSessionToken(user);
+function isHttpsRequest(req) {
+  return req.secure || req.get("x-forwarded-proto")?.split(",")[0]?.trim() === "https";
+}
+function extractSessionToken(req) {
+  const cookieToken = req.cookies?.[SESSION_COOKIE_NAME];
+  if (cookieToken) return cookieToken;
+  const authHeader = req.get("authorization");
+  if (authHeader && authHeader.toLowerCase().startsWith("bearer ")) {
+    const token = authHeader.slice(7).trim();
+    if (token) return token;
+  }
+  return void 0;
+}
+async function setSessionCookie(req, res, user) {
+  const token = await signSessionToken(user);
+  const https = isHttpsRequest(req);
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
-    secure: true,
-    sameSite: "none",
-    partitioned: true,
+    secure: https,
+    sameSite: https ? "none" : "lax",
+    ...https ? { partitioned: true } : {},
     path: "/",
     maxAge: SESSION_TTL_MS
   });
+  return token;
 }
-function clearSessionCookie(res) {
+function clearSessionCookie(req, res) {
+  const https = isHttpsRequest(req);
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
-    secure: true,
-    sameSite: "none",
-    partitioned: true,
+    secure: https,
+    sameSite: https ? "none" : "lax",
+    ...https ? { partitioned: true } : {},
     path: "/"
   });
 }
@@ -921,14 +1439,14 @@ async function requireAdmin(req, res, next) {
     res.status(403).json({ error: "Cross-site request blocked." });
     return;
   }
-  const rawToken = req.cookies?.[SESSION_COOKIE_NAME];
-  const payload = verifySessionToken(rawToken);
+  const rawToken = extractSessionToken(req);
+  const payload = await verifySessionToken(rawToken);
   if (!payload) {
     res.status(401).json({ error: "Administrator authentication required." });
     return;
   }
-  const envEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-  const envPass = process.env.ADMIN_PASSWORD?.trim();
+  const envEmail = getEnv("ADMIN_EMAIL")?.trim().toLowerCase();
+  const envPass = getEnv("ADMIN_PASSWORD")?.trim();
   if (envEmail && envPass && payload.id === "env-admin" && payload.email.toLowerCase() === envEmail) {
     req.admin = {
       id: payload.id,
@@ -936,7 +1454,7 @@ async function requireAdmin(req, res, next) {
       email: payload.email,
       role: payload.role
     };
-    next();
+    await next();
     return;
   }
   try {
@@ -956,8 +1474,12 @@ async function requireAdmin(req, res, next) {
       email: String(row.email),
       role: row.role
     };
-    next();
-  } catch {
+    await next();
+  } catch (err) {
+    if (err instanceof DatabaseConfigError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     res.status(500).json({ error: "Failed to verify administrator session." });
   }
 }
@@ -1144,30 +1666,26 @@ var mediaAltUpdateSchema = z.object({
 
 // src/server/routes/adminAuthRoutes.ts
 var adminAuthRoutes = Router();
-function safeCompareStrings(a, b) {
-  const bufA = Buffer.from(a, "utf8");
-  const bufB = Buffer.from(b, "utf8");
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual2(bufA, bufB);
+function getEnvCredentials() {
+  const envEmail = getEnv("ADMIN_EMAIL")?.trim().toLowerCase() || "";
+  const envPass = getEnv("ADMIN_PASSWORD")?.trim() || "";
+  return {
+    envEmail,
+    envPass,
+    hasEnvCredentials: Boolean(envEmail && envPass)
+  };
 }
 adminAuthRoutes.get("/status", async (req, res) => {
   try {
-    const db = await ensureDatabase();
-    const envPassword = process.env.ADMIN_PASSWORD?.trim();
-    const countRes = await db.execute("SELECT COUNT(*) as total FROM admins");
-    const adminCount = Number(countRes.rows[0]?.total ?? 0);
-    const needsSetup = adminCount === 0 && !envPassword;
-    const rawToken = req.cookies?.[SESSION_COOKIE_NAME];
-    const payload = verifySessionToken(rawToken);
-    if (!payload) {
-      res.json({ authenticated: false, needsSetup, admin: null });
-      return;
-    }
-    const envEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-    if (envEmail && envPassword && payload.id === "env-admin" && payload.email.toLowerCase() === envEmail) {
+    const { envEmail, hasEnvCredentials } = getEnvCredentials();
+    const authMode = hasEnvCredentials ? "env" : "db";
+    const rawToken = extractSessionToken(req);
+    const payload = await verifySessionToken(rawToken);
+    if (payload && hasEnvCredentials && payload.id === "env-admin" && payload.email.toLowerCase() === envEmail) {
       res.json({
         authenticated: true,
         needsSetup: false,
+        authMode,
         admin: {
           id: payload.id,
           name: payload.name,
@@ -1177,18 +1695,27 @@ adminAuthRoutes.get("/status", async (req, res) => {
       });
       return;
     }
+    const db = await ensureDatabase();
+    const countRes = await db.execute("SELECT COUNT(*) as total FROM admins");
+    const adminCount = Number(countRes.rows[0]?.total ?? 0);
+    const needsSetup = adminCount === 0 && !hasEnvCredentials;
+    if (!payload) {
+      res.json({ authenticated: false, needsSetup, authMode, admin: null });
+      return;
+    }
     const adminRes = await db.execute({
       sql: "SELECT id, name, email, role FROM admins WHERE id = ? LIMIT 1",
       args: [payload.id]
     });
     const row = adminRes.rows[0];
     if (!row) {
-      res.json({ authenticated: false, needsSetup, admin: null });
+      res.json({ authenticated: false, needsSetup, authMode, admin: null });
       return;
     }
     res.json({
       authenticated: true,
       needsSetup: false,
+      authMode,
       admin: {
         id: String(row.id),
         name: String(row.name),
@@ -1197,6 +1724,20 @@ adminAuthRoutes.get("/status", async (req, res) => {
       }
     });
   } catch (err) {
+    if (err instanceof DatabaseConfigError) {
+      const { hasEnvCredentials } = getEnvCredentials();
+      if (hasEnvCredentials) {
+        res.json({
+          authenticated: false,
+          needsSetup: false,
+          authMode: "env",
+          admin: null
+        });
+        return;
+      }
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     console.error("Auth status error:", err);
     res.status(500).json({ error: "Failed to inspect authentication state." });
   }
@@ -1207,7 +1748,8 @@ adminAuthRoutes.post("/setup", async (req, res) => {
     return;
   }
   try {
-    if (process.env.ADMIN_PASSWORD?.trim()) {
+    const { hasEnvCredentials } = getEnvCredentials();
+    if (hasEnvCredentials) {
       res.status(403).json({ error: "Initial setup is disabled because environment credentials are configured." });
       return;
     }
@@ -1218,7 +1760,7 @@ adminAuthRoutes.post("/setup", async (req, res) => {
     }
     const db = await ensureDatabase();
     const passwordHash = await hashPassword(parsed.data.password);
-    const adminId = randomUUID2();
+    const adminId = randomUUID();
     const emailNormalized = parsed.data.email.toLowerCase();
     const tx = await db.transaction("write");
     try {
@@ -1244,9 +1786,13 @@ adminAuthRoutes.post("/setup", async (req, res) => {
       email: emailNormalized,
       role: "super_admin"
     };
-    setSessionCookie(res, admin);
-    res.status(201).json({ admin });
+    const token = await setSessionCookie(req, res, admin);
+    res.status(201).json({ admin, token });
   } catch (err) {
+    if (err instanceof DatabaseConfigError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     console.error("Admin setup error:", err);
     res.status(500).json({ error: "Failed to initialize administrator account." });
   }
@@ -1263,17 +1809,16 @@ adminAuthRoutes.post("/login", async (req, res) => {
       return;
     }
     const emailNormalized = parsed.data.email.toLowerCase();
-    const envEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-    const envPass = process.env.ADMIN_PASSWORD?.trim();
-    if (envEmail && envPass && safeCompareStrings(emailNormalized, envEmail) && safeCompareStrings(parsed.data.password, envPass)) {
+    const { envEmail, envPass, hasEnvCredentials } = getEnvCredentials();
+    if (hasEnvCredentials && timingSafeEqualStrings(emailNormalized, envEmail) && timingSafeEqualStrings(parsed.data.password, envPass)) {
       const admin2 = {
         id: "env-admin",
         name: "System Administrator",
         email: envEmail,
         role: "super_admin"
       };
-      setSessionCookie(res, admin2);
-      res.json({ admin: admin2 });
+      const token2 = await setSessionCookie(req, res, admin2);
+      res.json({ admin: admin2, token: token2 });
       return;
     }
     const db = await ensureDatabase();
@@ -1297,9 +1842,13 @@ adminAuthRoutes.post("/login", async (req, res) => {
       email: String(row.email),
       role: String(row.role)
     };
-    setSessionCookie(res, admin);
-    res.json({ admin });
+    const token = await setSessionCookie(req, res, admin);
+    res.json({ admin, token });
   } catch (err) {
+    if (err instanceof DatabaseConfigError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     console.error("Admin login error:", err);
     res.status(500).json({ error: "Unable to authenticate administrator." });
   }
@@ -1309,16 +1858,11 @@ adminAuthRoutes.post("/logout", (req, res) => {
     res.status(403).json({ error: "Cross-site request blocked." });
     return;
   }
-  clearSessionCookie(res);
+  clearSessionCookie(req, res);
   res.json({ ok: true });
 });
 
-// src/server/routes/adminRoutes.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
-import { Router as Router2 } from "express";
-
 // src/server/cmsService.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
 var MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 function verifyImageMagicBytes(buf, mimeType) {
   if (buf.length < 4 || buf.length > MAX_IMAGE_BYTES) return false;
@@ -1330,7 +1874,14 @@ function verifyImageMagicBytes(buf, mimeType) {
     case "image/gif":
       return buf[0] === 71 && buf[1] === 73 && buf[2] === 70 && buf[3] === 56;
     case "image/webp":
-      return buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP";
+      return buf.length >= 12 && buf[0] === 82 && // R
+      buf[1] === 73 && // I
+      buf[2] === 70 && // F
+      buf[3] === 70 && // F
+      buf[8] === 87 && // W
+      buf[9] === 69 && // E
+      buf[10] === 66 && // B
+      buf[11] === 80;
     case "image/x-icon":
     case "image/vnd.microsoft.icon":
       return buf[0] === 0 && buf[1] === 0 && (buf[2] === 1 || buf[2] === 2) && buf[3] === 0;
@@ -1349,7 +1900,7 @@ async function recordAuditLog(admin, action, entityType, entityId, summary) {
     await db.execute({
       sql: `INSERT INTO audit_logs (id, admin_id, admin_email, action, entity_type, entity_id, summary)
             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      args: [randomUUID3(), admin.id, admin.email, action, entityType, entityId, summary]
+      args: [randomUUID(), admin.id, admin.email, action, entityType, entityId, summary]
     });
   } catch (err) {
     console.error("Failed to write audit log:", err);
@@ -1511,7 +2062,7 @@ async function getCmsWorkspacePayload() {
 }
 
 // src/server/routes/adminRoutes.ts
-var adminRoutes = Router2();
+var adminRoutes = Router();
 adminRoutes.use(requireAdmin);
 function parseFeatures(raw) {
   if (typeof raw !== "string") return [];
@@ -1698,7 +2249,7 @@ adminRoutes.post("/packages", async (req, res) => {
       return;
     }
     const db = await ensureDatabase();
-    const id = randomUUID4();
+    const id = randomUUID();
     const d = parsed.data;
     await db.execute({
       sql: `INSERT INTO packages (id, name, speed_mbps, monthly_price, description, features, image_url, show_on_home, status)
@@ -1922,7 +2473,7 @@ adminRoutes.post("/offers", async (req, res) => {
         return;
       }
     }
-    const id = randomUUID4();
+    const id = randomUUID();
     await db.execute({
       sql: `INSERT INTO offers (id, title, description, discount_type, discount_value, package_id, start_date, expiry_date, image_url, show_on_home, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -2124,7 +2675,7 @@ adminRoutes.post("/customers", async (req, res) => {
     }
     const db = await ensureDatabase();
     const d = parsed.data;
-    const customerId = randomUUID4();
+    const customerId = randomUUID();
     const initialPkgId = d.initial_package_id && d.initial_package_id.length > 0 ? d.initial_package_id : null;
     const tx = await db.transaction("write");
     let generatedCode = "RC-1001";
@@ -2166,7 +2717,7 @@ adminRoutes.post("/customers", async (req, res) => {
         await tx.execute({
           sql: `INSERT INTO subscriptions (id, customer_id, package_id, monthly_price, start_date, status)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')`,
-          args: [randomUUID4(), customerId, initialPkgId, Number(pkgRow.monthly_price)]
+          args: [randomUUID(), customerId, initialPkgId, Number(pkgRow.monthly_price)]
         });
       }
       await tx.commit();
@@ -2377,7 +2928,7 @@ adminRoutes.post("/subscriptions/assign", async (req, res) => {
     }
     const db = await ensureDatabase();
     const { customer_id, package_id, end_date } = parsed.data;
-    const subId = randomUUID4();
+    const subId = randomUUID();
     const tx = await db.transaction("write");
     try {
       const custRes = await tx.execute({
@@ -2506,9 +3057,7 @@ adminRoutes.patch("/inquiries/:id/status", async (req, res) => {
 });
 
 // src/server/routes/cmsAdminRoutes.ts
-import { randomUUID as randomUUID5 } from "node:crypto";
-import { Router as Router3 } from "express";
-var cmsAdminRoutes = Router3();
+var cmsAdminRoutes = Router();
 cmsAdminRoutes.use(requireAdmin);
 cmsAdminRoutes.get("/workspace", async (_req, res) => {
   try {
@@ -2569,7 +3118,7 @@ cmsAdminRoutes.post("/sections", async (req, res) => {
     }
     const db = await ensureDatabase();
     const d = parsed.data;
-    const id = randomUUID5();
+    const id = randomUUID();
     const sectionKey = `custom_${Date.now()}_${id.slice(0, 4)}`;
     const maxOrderRes = await db.execute({
       sql: "SELECT COALESCE(MAX(draft_order), 0) AS max_order FROM page_contents WHERE page_slug = ? AND deleted_in_draft = 0",
@@ -2724,7 +3273,7 @@ cmsAdminRoutes.put("/settings", async (req, res) => {
                   draft_value = excluded.draft_value,
                   has_unpublished_changes = CASE WHEN website_settings.published_value != excluded.draft_value THEN 1 ELSE 0 END,
                   updated_at = CURRENT_TIMESTAMP`,
-          args: [randomUUID5(), key, serialized]
+          args: [randomUUID(), key, serialized]
         });
       }
       await tx.commit();
@@ -2906,7 +3455,13 @@ cmsAdminRoutes.post("/media", async (req, res) => {
     }
     const d = parsed.data;
     const rawBase64 = d.data_base64.includes(",") ? d.data_base64.split(",")[1] || "" : d.data_base64;
-    const buf = Buffer.from(rawBase64, "base64");
+    let buf;
+    try {
+      buf = base64ToBytes(rawBase64);
+    } catch {
+      res.status(400).json({ error: "Invalid base64 image payload." });
+      return;
+    }
     if (!verifyImageMagicBytes(buf, d.file_type)) {
       res.status(400).json({
         error: "Invalid or unsupported image file. Upload a valid PNG, JPEG, WebP, GIF, or ICO under 2 MB."
@@ -2914,13 +3469,13 @@ cmsAdminRoutes.post("/media", async (req, res) => {
       return;
     }
     const db = await ensureDatabase();
-    const id = randomUUID5();
+    const id = randomUUID();
     const safeName = sanitizeFileName(d.file_name);
     const fileUrl = `/api/public/media/${id}`;
     await db.execute({
       sql: `INSERT INTO media_assets (id, file_name, file_url, alt_text, file_type, file_size, category, is_builtin, data_base64)
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-      args: [id, safeName, fileUrl, d.alt_text, d.file_type, buf.length, d.category, buf.toString("base64")]
+      args: [id, safeName, fileUrl, d.alt_text, d.file_type, buf.length, d.category, bytesToBase64(buf)]
     });
     await recordAuditLog(
       req.admin,
@@ -2954,7 +3509,13 @@ cmsAdminRoutes.put("/media/:id/replace", async (req, res) => {
     }
     const d = parsed.data;
     const rawBase64 = d.data_base64.includes(",") ? d.data_base64.split(",")[1] || "" : d.data_base64;
-    const buf = Buffer.from(rawBase64, "base64");
+    let buf;
+    try {
+      buf = base64ToBytes(rawBase64);
+    } catch {
+      res.status(400).json({ error: "Invalid base64 replacement image." });
+      return;
+    }
     if (!verifyImageMagicBytes(buf, d.file_type)) {
       res.status(400).json({
         error: "Invalid or unsupported image file. Upload a valid PNG, JPEG, WebP, GIF, or ICO under 2 MB."
@@ -2986,7 +3547,7 @@ cmsAdminRoutes.put("/media/:id/replace", async (req, res) => {
           d.alt_text,
           d.file_type,
           buf.length,
-          buf.toString("base64"),
+          bytesToBase64(buf),
           req.params.id
         ]
       });
@@ -3107,9 +3668,7 @@ cmsAdminRoutes.get("/audit-logs", async (_req, res) => {
 });
 
 // src/server/routes/publicRoutes.ts
-import { randomUUID as randomUUID6 } from "node:crypto";
-import { Router as Router4 } from "express";
-var publicRoutes = Router4();
+var publicRoutes = Router();
 function parseFeatures2(raw) {
   if (typeof raw !== "string") return [];
   try {
@@ -3123,8 +3682,8 @@ publicRoutes.get("/site", async (req, res) => {
   try {
     let mode = "published";
     if (req.query.preview === "1") {
-      const token = req.cookies?.[SESSION_COOKIE_NAME];
-      const payload = verifySessionToken(token);
+      const token = extractSessionToken(req);
+      const payload = await verifySessionToken(token);
       if (payload && (payload.role === "admin" || payload.role === "super_admin")) {
         mode = "draft";
       }
@@ -3149,11 +3708,11 @@ publicRoutes.get("/media/:id", async (req, res) => {
       return;
     }
     const fileType = String(row.file_type);
-    const buffer = Buffer.from(String(row.data_base64), "base64");
+    const bytes = base64ToBytes(String(row.data_base64));
     res.setHeader("Content-Type", fileType);
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "public, max-age=86400");
-    res.send(buffer);
+    res.send(bytes);
   } catch (err) {
     console.error("Media serve error:", err);
     res.status(500).send("Unable to serve media asset.");
@@ -3278,7 +3837,7 @@ publicRoutes.post("/inquiries", async (req, res) => {
     }
     const db = await ensureDatabase();
     const data = parsed.data;
-    const id = randomUUID6();
+    const id = randomUUID();
     const packageId = data.package_id && data.package_id.length > 0 ? data.package_id : null;
     if (packageId) {
       const pkgCheck = await db.execute({
@@ -3316,7 +3875,27 @@ publicRoutes.post("/inquiries", async (req, res) => {
   }
 });
 
+// src/server/apiMounts.ts
+var mountedApiRoutes = [
+  { prefix: "/api/public", router: publicRoutes },
+  { prefix: "/api/admin/auth", router: adminAuthRoutes },
+  { prefix: "/api/admin/cms", router: cmsAdminRoutes },
+  { prefix: "/api/admin", router: adminRoutes }
+];
+var handleApiFetch = createFetchApiHandler(mountedApiRoutes);
+
 // server.ts
+var scryptAsync = promisify(scryptCallback);
+registerLegacyScryptVerifier(async (password, storedHash) => {
+  const parts = storedHash.split(":");
+  if (parts.length !== 2) return false;
+  const [salt, expectedHex] = parts;
+  if (!salt || !expectedHex) return false;
+  const expectedBuf = Buffer.from(expectedHex, "hex");
+  const derivedBuf = await scryptAsync(password, salt, 64);
+  if (expectedBuf.length !== derivedBuf.length) return false;
+  return timingSafeEqual(expectedBuf, derivedBuf);
+});
 var PORT = Number(process.env.PORT || 3e3);
 var isProduction = process.env.NODE_ENV === "production";
 async function startServer() {
@@ -3326,15 +3905,26 @@ async function startServer() {
   app.disable("x-powered-by");
   app.use(express.json({ limit: "4mb" }));
   app.use(cookieParser());
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    const origin = req.get("origin");
+    if (origin && req.path.startsWith("/api/")) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+      res.setHeader("Vary", "Origin");
+      if (req.method.toUpperCase() === "OPTIONS") {
+        res.status(204).end();
+        return;
+      }
+    }
     next();
   });
-  app.use("/api/public", publicRoutes);
-  app.use("/api/admin/auth", adminAuthRoutes);
-  app.use("/api/admin/cms", cmsAdminRoutes);
-  app.use("/api/admin", adminRoutes);
+  for (const mount of mountedApiRoutes) {
+    mountMiniRouterOnExpress(app, mount.prefix, mount.router);
+  }
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
   });
@@ -3344,13 +3934,20 @@ async function startServer() {
   if (!isProduction) {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false, ws: false, watch: null },
       appType: "spa"
     });
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), "dist");
     app.use("/src/assets/images", express.static(path.resolve(process.cwd(), "src/assets/images")));
+    app.use((req, res, next) => {
+      if (req.path === "/_worker.js" || req.path === "/_routes.json") {
+        res.status(404).end();
+        return;
+      }
+      next();
+    });
     app.use(express.static(distDir));
     app.get("*", (_req, res) => {
       const indexHtml = path.join(distDir, "index.html");

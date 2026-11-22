@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { Router } from 'express';
+import { Router } from '../miniRouter.js';
+import { randomUUID } from '../cryptoWeb.js';
 import { ensureDatabase } from '../db.js';
 import { requireAdmin, type AuthenticatedRequest } from '../auth.js';
 import { recordAuditLog } from '../cmsService.js';

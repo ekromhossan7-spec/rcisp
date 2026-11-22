@@ -1,7 +1,7 @@
-import { randomUUID } from 'node:crypto';
-import { Router } from 'express';
+import { Router } from '../miniRouter.js';
+import { base64ToBytes, randomUUID } from '../cryptoWeb.js';
 import { ensureDatabase } from '../db.js';
-import { SESSION_COOKIE_NAME, verifySessionToken } from '../auth.js';
+import { extractSessionToken, verifySessionToken } from '../auth.js';
 import { getPublicSitePayload } from '../cmsService.js';
 import { inquiryCreateSchema } from '../validations.js';
 import type { OfferRecord, OfferSummary, PackageRecord } from '../../types/isp.js';
@@ -23,8 +23,8 @@ publicRoutes.get('/site', async (req, res) => {
   try {
     let mode: 'draft' | 'published' = 'published';
     if (req.query.preview === '1') {
-      const token = req.cookies?.[SESSION_COOKIE_NAME] as string | undefined;
-      const payload = verifySessionToken(token);
+      const token = extractSessionToken(req);
+      const payload = await verifySessionToken(token);
       if (payload && (payload.role === 'admin' || payload.role === 'super_admin')) {
         mode = 'draft';
       }
@@ -52,11 +52,11 @@ publicRoutes.get('/media/:id', async (req, res) => {
     }
 
     const fileType = String(row.file_type);
-    const buffer = Buffer.from(String(row.data_base64), 'base64');
+    const bytes = base64ToBytes(String(row.data_base64));
     res.setHeader('Content-Type', fileType);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.send(buffer);
+    res.send(bytes);
   } catch (err) {
     console.error('Media serve error:', err);
     res.status(500).send('Unable to serve media asset.');

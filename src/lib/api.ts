@@ -28,6 +28,36 @@ export class ApiError extends Error {
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+const ADMIN_TOKEN_KEY = 'rc_admin_token';
+let inMemoryToken: string | null = null;
+
+function getStoredToken(): string | null {
+  if (inMemoryToken) return inMemoryToken;
+  try {
+    return window.sessionStorage.getItem(ADMIN_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function setStoredToken(token: string | undefined | null): void {
+  if (!token) return;
+  inMemoryToken = token;
+  try {
+    window.sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
+  } catch {
+    // Ignore storage access errors in restricted contexts
+  }
+}
+
+function clearStoredToken(): void {
+  inMemoryToken = null;
+  try {
+    window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  } catch {
+    // Ignore storage access errors
+  }
+}
 
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
@@ -36,6 +66,11 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   }
   headers.set('X-Requested-With', 'XMLHttpRequest');
 
+  const storedToken = getStoredToken();
+  if (storedToken && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${storedToken}`);
+  }
+
   const targetUrl = url.startsWith('/') && API_BASE ? `${API_BASE}${url}` : url;
 
   const res = await fetch(targetUrl, {
@@ -43,6 +78,10 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
     headers,
     credentials: 'include',
   });
+
+  if (res.status === 401 && url.startsWith('/api/admin/') && !url.startsWith('/api/admin/auth/')) {
+    clearStoredToken();
+  }
 
   const text = await res.text();
   const contentType = res.headers.get('content-type') || '';
@@ -60,10 +99,15 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   }
 
   if (!res.ok) {
-    const msg =
-      data && typeof data.error === 'string'
-        ? data.error
-        : `Request failed (${res.status})`;
+    let msg: string;
+    if (data && typeof data.error === 'string') {
+      msg = data.error;
+    } else if ((res.status === 404 || res.status === 405) && url.startsWith('/api/')) {
+      msg =
+        'Backend API endpoint not found (404). Deploy with the latest dist/_worker.js (Cloudflare Pages) or Node server, or set VITE_API_BASE_URL.';
+    } else {
+      msg = `Request failed (${res.status})`;
+    }
     throw new ApiError(msg, res.status);
   }
 
@@ -100,23 +144,37 @@ export const publicApi = {
 
 export const adminAuthApi = {
   getStatus: () =>
-    request<{ authenticated: boolean; needsSetup: boolean; admin: AdminUser | null }>(
-      '/api/admin/auth/status',
-    ),
-  setup: (payload: { name: string; email: string; password: string }) =>
-    request<{ admin: AdminUser }>('/api/admin/auth/setup', {
+    request<{
+      authenticated: boolean;
+      needsSetup: boolean;
+      authMode?: 'env' | 'db';
+      admin: AdminUser | null;
+    }>('/api/admin/auth/status'),
+  setup: async (payload: { name: string; email: string; password: string }) => {
+    const data = await request<{ admin: AdminUser; token?: string }>('/api/admin/auth/setup', {
       method: 'POST',
       body: JSON.stringify(payload),
-    }),
-  login: (payload: { email: string; password: string }) =>
-    request<{ admin: AdminUser }>('/api/admin/auth/login', {
+    });
+    setStoredToken(data.token);
+    return data;
+  },
+  login: async (payload: { email: string; password: string }) => {
+    const data = await request<{ admin: AdminUser; token?: string }>('/api/admin/auth/login', {
       method: 'POST',
       body: JSON.stringify(payload),
-    }),
-  logout: () =>
-    request<{ ok: boolean }>('/api/admin/auth/logout', {
-      method: 'POST',
-    }),
+    });
+    setStoredToken(data.token);
+    return data;
+  },
+  logout: async () => {
+    try {
+      return await request<{ ok: boolean }>('/api/admin/auth/logout', {
+        method: 'POST',
+      });
+    } finally {
+      clearStoredToken();
+    }
+  },
 };
 
 export const adminApi = {

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from './cryptoWeb.js';
 import { ensureDatabase } from './db.js';
 import { DEFAULT_PAGE_SEO, DEFAULT_SETTINGS } from './cmsSeed.js';
 import type {
@@ -16,7 +16,7 @@ import type {
 
 export const MAX_IMAGE_BYTES = 2 * 1024 * 1024; // 2 MB
 
-export function verifyImageMagicBytes(buf: Buffer, mimeType: string): boolean {
+export function verifyImageMagicBytes(buf: Uint8Array, mimeType: string): boolean {
   if (buf.length < 4 || buf.length > MAX_IMAGE_BYTES) return false;
   switch (mimeType) {
     case 'image/png':
@@ -38,8 +38,14 @@ export function verifyImageMagicBytes(buf: Buffer, mimeType: string): boolean {
     case 'image/webp':
       return (
         buf.length >= 12 &&
-        buf.toString('ascii', 0, 4) === 'RIFF' &&
-        buf.toString('ascii', 8, 12) === 'WEBP'
+        buf[0] === 0x52 && // R
+        buf[1] === 0x49 && // I
+        buf[2] === 0x46 && // F
+        buf[3] === 0x46 && // F
+        buf[8] === 0x57 && // W
+        buf[9] === 0x45 && // E
+        buf[10] === 0x42 && // B
+        buf[11] === 0x50 // P
       );
     case 'image/x-icon':
     case 'image/vnd.microsoft.icon':

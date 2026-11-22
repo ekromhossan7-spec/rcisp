@@ -1,45 +1,51 @@
-import {
-  createHmac,
-  randomBytes,
-  scrypt as scryptCallback,
-  timingSafeEqual,
-} from 'node:crypto';
-import { promisify } from 'node:util';
-import type { NextFunction, Request, Response } from 'express';
 import type { AdminUser } from '../types/isp.js';
-import { ensureDatabase } from './db.js';
-
-const scryptAsync = promisify(scryptCallback);
+import {
+  base64UrlToUtf8,
+  hashPasswordPortable,
+  randomHex,
+  signHmacSha256,
+  utf8ToBase64Url,
+  verifyHmacSha256,
+  verifyPasswordPortable,
+} from './cryptoWeb.js';
+import { DatabaseConfigError, ensureDatabase } from './db.js';
+import type { MiniNext, MiniRequest, MiniResponse } from './miniRouter.js';
+import { getEnv } from './runtimeEnv.js';
 
 export const SESSION_COOKIE_NAME = 'rc_admin_session';
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
-// In-memory fallback secret when SESSION_SECRET env var is unset
-const EPHEMERAL_SESSION_SECRET = randomBytes(32).toString('hex');
+// In-memory fallback secret when no configured secret/seed env vars exist
+const EPHEMERAL_SESSION_SECRET = randomHex(32);
 
-function getSessionSecret(): string {
-  const configured = process.env.SESSION_SECRET?.trim();
-  return configured && configured.length >= 16 ? configured : EPHEMERAL_SESSION_SECRET;
+async function getSessionSecret(): Promise<string> {
+  const configured = getEnv('SESSION_SECRET')?.trim();
+  if (configured && configured.length >= 16) return configured;
+
+  // Deterministic cross-isolate fallback on serverless runtimes when SESSION_SECRET is omitted
+  const seedMaterial = getEnv('TURSO_AUTH_TOKEN')?.trim() || getEnv('ADMIN_PASSWORD')?.trim();
+  if (seedMaterial) {
+    const digest = await globalThis.crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(`rc-session-v1:${seedMaterial}`),
+    );
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  return EPHEMERAL_SESSION_SECRET;
 }
 
 export async function hashPassword(password: string): Promise<string> {
-  const salt = randomBytes(16).toString('hex');
-  const derived = (await scryptAsync(password, salt, 64)) as Buffer;
-  return `${salt}:${derived.toString('hex')}`;
+  return hashPasswordPortable(password);
 }
 
 export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
-  const parts = storedHash.split(':');
-  if (parts.length !== 2) return false;
-  const [salt, expectedHex] = parts;
-  if (!salt || !expectedHex) return false;
-  const expectedBuf = Buffer.from(expectedHex, 'hex');
-  const derivedBuf = (await scryptAsync(password, salt, 64)) as Buffer;
-  if (expectedBuf.length !== derivedBuf.length) return false;
-  return timingSafeEqual(expectedBuf, derivedBuf);
+  return verifyPasswordPortable(password, storedHash);
 }
 
-interface SessionPayload {
+export interface SessionPayload {
   id: string;
   name: string;
   email: string;
@@ -47,7 +53,7 @@ interface SessionPayload {
   exp: number;
 }
 
-export function signSessionToken(user: AdminUser): string {
+export async function signSessionToken(user: AdminUser): Promise<string> {
   const payload: SessionPayload = {
     id: user.id,
     name: user.name,
@@ -55,12 +61,15 @@ export function signSessionToken(user: AdminUser): string {
     role: user.role,
     exp: Date.now() + SESSION_TTL_MS,
   };
-  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const sig = createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
+  const encoded = utf8ToBase64Url(JSON.stringify(payload));
+  const secret = await getSessionSecret();
+  const sig = await signHmacSha256(encoded, secret);
   return `${encoded}.${sig}`;
 }
 
-export function verifySessionToken(token: string | undefined): SessionPayload | null {
+export async function verifySessionToken(
+  token: string | undefined,
+): Promise<SessionPayload | null> {
   if (!token) return null;
   const dotIdx = token.indexOf('.');
   if (dotIdx <= 0) return null;
@@ -68,15 +77,12 @@ export function verifySessionToken(token: string | undefined): SessionPayload | 
   const sig = token.slice(dotIdx + 1);
   if (!encoded || !sig) return null;
 
-  const expectedSig = createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
-  const sigBuf = Buffer.from(sig);
-  const expectedBuf = Buffer.from(expectedSig);
-  if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
-    return null;
-  }
+  const secret = await getSessionSecret();
+  const validSig = await verifyHmacSha256(encoded, sig, secret);
+  if (!validSig) return null;
 
   try {
-    const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SessionPayload;
+    const parsed = JSON.parse(base64UrlToUtf8(encoded)) as SessionPayload;
     if (!parsed || typeof parsed.exp !== 'number' || parsed.exp < Date.now()) {
       return null;
     }
@@ -89,39 +95,61 @@ export function verifySessionToken(token: string | undefined): SessionPayload | 
   }
 }
 
-export function setSessionCookie(res: Response, user: AdminUser): void {
-  const token = signSessionToken(user);
+function isHttpsRequest(req: MiniRequest): boolean {
+  return req.secure || req.get('x-forwarded-proto')?.split(',')[0]?.trim() === 'https';
+}
+
+export function extractSessionToken(req: MiniRequest): string | undefined {
+  const cookieToken = req.cookies?.[SESSION_COOKIE_NAME];
+  if (cookieToken) return cookieToken;
+
+  const authHeader = req.get('authorization');
+  if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (token) return token;
+  }
+  return undefined;
+}
+
+export async function setSessionCookie(
+  req: MiniRequest,
+  res: MiniResponse,
+  user: AdminUser,
+): Promise<string> {
+  const token = await signSessionToken(user);
+  const https = isHttpsRequest(req);
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    partitioned: true,
+    secure: https,
+    sameSite: https ? 'none' : 'lax',
+    ...(https ? { partitioned: true } : {}),
     path: '/',
     maxAge: SESSION_TTL_MS,
   });
+  return token;
 }
 
-export function clearSessionCookie(res: Response): void {
+export function clearSessionCookie(req: MiniRequest, res: MiniResponse): void {
+  const https = isHttpsRequest(req);
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    partitioned: true,
+    secure: https,
+    sameSite: https ? 'none' : 'lax',
+    ...(https ? { partitioned: true } : {}),
     path: '/',
   });
 }
 
-export interface AuthenticatedRequest extends Request {
+export interface AuthenticatedRequest extends MiniRequest {
   admin?: AdminUser;
 }
 
-export function verifyCsrfProtection(req: Request): boolean {
+export function verifyCsrfProtection(req: MiniRequest): boolean {
   const method = req.method.toUpperCase();
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
     return true;
   }
 
-  // Verify custom header or matching Origin against Host / X-Forwarded-Host
   const requestedWith = req.get('x-requested-with');
   if (requestedWith === 'XMLHttpRequest') {
     return true;
@@ -142,24 +170,23 @@ export function verifyCsrfProtection(req: Request): boolean {
 
 export async function requireAdmin(
   req: AuthenticatedRequest,
-  res: Response,
-  next: NextFunction,
+  res: MiniResponse,
+  next: MiniNext,
 ): Promise<void> {
   if (!verifyCsrfProtection(req)) {
     res.status(403).json({ error: 'Cross-site request blocked.' });
     return;
   }
 
-  const rawToken = req.cookies?.[SESSION_COOKIE_NAME] as string | undefined;
-  const payload = verifySessionToken(rawToken);
+  const rawToken = extractSessionToken(req);
+  const payload = await verifySessionToken(rawToken);
   if (!payload) {
     res.status(401).json({ error: 'Administrator authentication required.' });
     return;
   }
 
-  // Verify env-configured admin or database admin record
-  const envEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
-  const envPass = process.env.ADMIN_PASSWORD?.trim();
+  const envEmail = getEnv('ADMIN_EMAIL')?.trim().toLowerCase();
+  const envPass = getEnv('ADMIN_PASSWORD')?.trim();
   if (envEmail && envPass && payload.id === 'env-admin' && payload.email.toLowerCase() === envEmail) {
     req.admin = {
       id: payload.id,
@@ -167,7 +194,7 @@ export async function requireAdmin(
       email: payload.email,
       role: payload.role,
     };
-    next();
+    await next();
     return;
   }
 
@@ -188,8 +215,12 @@ export async function requireAdmin(
       email: String(row.email),
       role: row.role as 'super_admin' | 'admin',
     };
-    next();
-  } catch {
+    await next();
+  } catch (err) {
+    if (err instanceof DatabaseConfigError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     res.status(500).json({ error: 'Failed to verify administrator session.' });
   }
 }
