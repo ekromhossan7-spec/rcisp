@@ -112,8 +112,9 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   }
 
   if (!data || (!contentType.includes('application/json') && text.trim().startsWith('<'))) {
+    const hostLabel = typeof window !== 'undefined' ? window.location.host : 'this host';
     throw new ApiError(
-      'Backend API is unavailable at this host (received non-JSON response).',
+      `Backend API is unavailable at ${hostLabel} (${url} returned ${res.status} non-JSON HTML).`,
       502,
     );
   }
